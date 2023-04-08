@@ -1,0 +1,164 @@
+from math import log, sqrt, exp
+import time
+import datetime as dt                   # date objects
+import numpy as np                      # array manipulation
+import matplotlib.pyplot as plot        # plotting
+import pandas as pd                     # data analysis
+import pandas_datareader as pdr
+from scipy.stats import norm  # normal cdf
+
+from ib_insync import *
+util.startLoop()
+
+
+# pull data from 
+indicators = ['SPY']
+end_date = dt.date.today()
+start_date = end_date - dt.timedelta(days=365)
+raw_data = pdr.DataReader(indicators, 'yahoo', start_date, end_date)
+data = raw_data['Adj Close']
+
+std_SPY = data.tail(252).SPY.std()
+mean_SPY = data.tail(252).SPY.mean()
+print(f"Annual Volatility SPY: {std_SPY}")
+
+try:
+    ib.disconnect()
+    time.sleep(5)
+except:
+    print("no ib connection to disconnect")
+
+# initialize connection to IBKR
+ib = IB()
+ib.connect('127.0.0.1', 7497, clientId=12)  # IB Trader Workstation
+#ib.connect('127.0.0.1', 4002, clientId=1)    # IB Gateway
+
+ib.positions()
+
+
+# create a contract for the underlying s&p500 index
+spx = Stock('SPY', 'SMART', 'USD')
+ib.qualifyContracts(spx)
+ib.reqMarketDataType(4)
+
+# grab the ticker
+[ticker] = ib.reqTickers(spx)
+spx_price = ticker.marketPrice()
+
+# generate the option chain
+opt_chain = ib.reqSecDefOptParams(spx.symbol, '', spx.secType, spx.conId)
+chain = next(c for c in opt_chain if c.tradingClass == 'SPY' and c.exchange == 'SMART')
+
+# filter strikes for those close to in the money
+strikes = [s for s in chain.strikes
+           if spx_price - 20 < s < spx_price + 20]
+
+expirations = sorted(exp for exp in chain.expirations)[:3]
+expirations = ['20221021']
+
+rights = ['C']
+
+contracts = [Option('SPY', expiration, strike, right, 'SMART', tradingClass='SPY')
+        for right in rights
+        for expiration in expirations
+        for strike in strikes]
+contracts = ib.qualifyContracts(*contracts)
+ib.reqMarketDataType(4)
+
+# grab an example contract
+call = contracts[0]
+[ticker] = ib.reqTickers(call)
+ticker
+
+def bs_price(S, K, T, r, sigma, opt="c"):
+    """Price an option with the black-scholes model
+
+        S (float): Price of the underlying security
+        K (float): Strike price
+        T (float): time to maturity
+        r (float): risk free interest rate
+        sigma (float): volatility of the underlying security
+        opt (str, optional): option type. Defaults to "C" (call)
+
+    Returns:
+        float: the black-scholes price of the option
+    """
+    d1 = (np.log(S / K) + (r + sigma**2 / 2.0) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+
+    if opt == "c":
+        bs_price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    elif opt == "p":
+        bs_price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+    else:
+        bs_price = None
+    return bs_price
+    
+    
+    price = spx_price
+strike = ticker.contract.strike
+maturity = 22/365
+rfr = 0.036  # use shortterm libor!
+vol = std_SPY / mean_SPY
+
+opt_price = bs_price(price, strike, maturity, rfr, vol)
+
+print(f"The close price of the option is: {ticker.close}")
+
+ib.positions()
+
+# get current positions
+positions = [p for p in ib.positions() if p.contract.symbol == "SPY"]
+
+# ensure that you have an open option position
+opts = [p for p in positions if p.contract.secType == "OPT"]
+if not opts:
+    print("No option position to hedge")
+option = opts[0]
+con = option.contract
+
+contracts = ib.qualifyContracts(con)
+ib.reqMarketDataType(4)
+[ticker] = ib.reqTickers(*contracts)
+ticker
+
+
+
+# get the option delta from IB
+delta = ticker.modelGreeks.delta
+delta_neutral_pos = round(-option.position * delta * 100)
+
+# calculate the difference between the hedge requirement and the current position
+stks = [p for p in positions if p.contract.secType == "STK"]
+if stks:
+    hedge = delta_neutral_pos - stks[0].position
+else:
+    hedge = delta_neutral_pos
+print(f"The deltahedge trade needed is SPY: {hedge}")
+
+
+
+# execute the trade if the hedge outweighs the risk
+if abs(hedge) > 0:
+    if hedge > 0:
+        action = "BUY"
+    else:
+        action = "SELL"
+        
+    # return contract and order required to remain delta neutral
+    contract = Stock("SPY", "SMART", "USD")
+    ib.qualifyContracts(contract)
+    order = MarketOrder(action, abs(hedge))
+    
+    # place trade
+    trade = ib.placeOrder(contract, order)
+    assert order in ib.orders()
+    assert trade in ib.trades()
+    while not trade.isDone():
+        ib.waitOnUpdate()
+else:
+    print("Already delta-neutral, no trade required.")
+    
+    
+    ib.positions()
+    ib.disconnect()
